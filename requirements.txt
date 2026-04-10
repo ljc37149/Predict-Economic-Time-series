@@ -1,0 +1,6 @@
+numpy>=1.23
+pandas>=2.0
+tensorflow>=2.13
+statsmodels>=0.14
+scikit-learn>=1.3
+requests>=2.31
