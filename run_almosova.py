@@ -5,6 +5,9 @@ DOI 10.1002/for.2901 — US CPI inflation, expanding-window forecasts from 1990.
 Example:
   python run_almosova.py --quick
   python run_almosova.py --data nsa --max-origins 24 --epochs 300 --models RW AR NN LSTM SARIMA
+  python run_almosova.py --epochs 500 --progress --progress-every 5
+  python run_almosova.py --state rolling.pkl --progress
+  python run_almosova.py --state rolling.pkl --resume --progress
 """
 
 from __future__ import annotations
@@ -38,7 +41,40 @@ def main() -> None:
         default=["RW", "AR", "NN", "LSTM", "SARIMA", "MS"],
         help="Models to run",
     )
+    ap.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print one line after each rolling origin (helps when stdout is redirected to a log)",
+    )
+    ap.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --progress, emit a line every N origins (still logs first & last); default 1 = all origins",
+    )
+    ap.add_argument(
+        "--state",
+        default=None,
+        metavar="PATH",
+        help="Pickle checkpoint path: save partial sums for resume after each origin (or see --save-every)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="With --state, load checkpoint if the file exists (metadata must match this run)",
+    )
+    ap.add_argument(
+        "--save-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --state, write checkpoint every N completed origins (default: 1)",
+    )
     args = ap.parse_args()
+
+    if args.resume and not args.state:
+        ap.error("--resume requires --state PATH")
 
     if args.quick:
         args.max_origins = 3
@@ -61,6 +97,11 @@ def main() -> None:
         cfg=cfg,
         models=args.models,
         max_test_origins=args.max_origins,
+        progress=args.progress,
+        progress_every=max(1, args.progress_every),
+        state_path=args.state,
+        resume=args.resume,
+        save_every=max(1, args.save_every),
     )
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", 20)
