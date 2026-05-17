@@ -13,18 +13,18 @@ def set_seeds(seed: int = 42) -> None:
     tf.random.set_seed(seed)
 
 
-def build_ar_linear(p: int, lr: float) -> keras.Model:
+def build_ar_linear(input_dim: int, lr: float) -> keras.Model:
     """AR as single linear layer (identity activation), same as paper."""
-    inp = layers.Input(shape=(p,))
+    inp = layers.Input(shape=(input_dim,))
     out = layers.Dense(1, activation="linear", use_bias=True)(inp)
     model = keras.Model(inp, out)
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss="mse")
     return model
 
 
-def build_nn(p: int, hidden: int, lr: float) -> keras.Model:
+def build_nn(input_dim: int, hidden: int, lr: float) -> keras.Model:
     """One hidden layer, ReLU (paper)."""
-    inp = layers.Input(shape=(p,))
+    inp = layers.Input(shape=(input_dim,))
     h = layers.Dense(hidden, activation="relu")(inp)
     out = layers.Dense(1)(h)
     model = keras.Model(inp, out)
@@ -32,9 +32,9 @@ def build_nn(p: int, hidden: int, lr: float) -> keras.Model:
     return model
 
 
-def build_lstm(p: int, hidden: int, lr: float) -> keras.Model:
-    """LSTM over p lags; one scalar input per time step (paper Fig. 5–6)."""
-    inp = layers.Input(shape=(p, 1))
+def build_lstm(p: int, hidden: int, lr: float, n_features: int = 1) -> keras.Model:
+    """LSTM over p lags; each time step can contain multiple features."""
+    inp = layers.Input(shape=(p, n_features))
     x = layers.LSTM(hidden)(inp)
     out = layers.Dense(1)(x)
     model = keras.Model(inp, out)

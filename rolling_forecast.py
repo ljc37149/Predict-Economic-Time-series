@@ -13,7 +13,6 @@ ROLLING_STATE_VERSION = 1
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.ar_model import AutoReg
 from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoregression
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
@@ -38,17 +37,18 @@ class RollConfig:
 
 
 def _scale_xy_lstm(X_chrono: np.ndarray, y: np.ndarray):
-    n, p = X_chrono.shape
-    sx = StandardScaler().fit(X_chrono)
+    n, p, f = X_chrono.shape
+    sx = StandardScaler().fit(X_chrono.reshape(-1, f))
     sy = StandardScaler().fit(y.reshape(-1, 1))
-    Xs = sx.transform(X_chrono).reshape(n, p, 1)
+    Xs = sx.transform(X_chrono.reshape(-1, f)).reshape(n, p, f)
     ys = sy.transform(y.reshape(-1, 1)).ravel()
     return Xs, ys, sx, sy
 
 
 def _scale_xy_ff(X_chrono: np.ndarray, y: np.ndarray):
-    """Feedforward models: rows [y_{t-1},...,y_{t-p}]."""
-    X_ff = np.flip(X_chrono, axis=1)
+    """Feedforward models: rows [lagged features at t-1 ... t-p]."""
+    n = X_chrono.shape[0]
+    X_ff = np.flip(X_chrono, axis=1).reshape(n, -1)
     sx = StandardScaler().fit(X_ff)
     sy = StandardScaler().fit(y.reshape(-1, 1))
     Xs = sx.transform(X_ff)
@@ -64,20 +64,42 @@ def _predict_multistep_tf(
     horizon: int,
     sx: StandardScaler,
     sy: StandardScaler,
+    exog_future: np.ndarray | None = None,
 ) -> np.ndarray:
     out = np.zeros(horizon)
-    cur = lags_chrono.astype(np.float64).copy()
+    cur = lags_chrono.astype(np.float64).copy()  # shape (p, n_features)
+    n_features = cur.shape[1]
+    has_exog = n_features > 1
     for h in range(horizon):
         if kind == "lstm":
-            x2 = sx.transform(cur.reshape(1, -1)).reshape(1, p, 1)
+            x2 = sx.transform(cur.reshape(-1, n_features)).reshape(1, p, n_features)
         else:
-            x_ff = np.flip(cur).reshape(1, -1)
+            x_ff = np.flip(cur, axis=0).reshape(1, -1)
             x2 = sx.transform(x_ff)
         raw = predict_one_step(model, x2, kind)
         out[h] = inverse_scaled_pred(raw, sy)
-        cur = np.roll(cur, -1)
-        cur[-1] = out[h]
+        cur = np.roll(cur, -1, axis=0)
+        cur[-1, 0] = out[h]
+        if has_exog:
+            if exog_future is not None and h < len(exog_future):
+                cur[-1, 1:] = exog_future[h]
+            else:
+                cur[-1, 1:] = cur[-2, 1:]
     return out
+
+
+def _build_xy_with_exog(y_arr: np.ndarray, exog_arr: np.ndarray | None, p: int) -> tuple[np.ndarray, np.ndarray]:
+    X_y, Y = y_to_matrix(y_arr, p)
+    if exog_arr is None:
+        return X_y[:, :, np.newaxis], Y
+    if len(exog_arr) != len(y_arr):
+        raise ValueError("exog length must match y length")
+    rows_ex = []
+    for s in range(p, len(y_arr)):
+        rows_ex.append(exog_arr[s - p : s, :])
+    X_ex = np.asarray(rows_ex, dtype=np.float64)
+    X = np.concatenate([X_y[:, :, np.newaxis], X_ex], axis=2)
+    return X, Y
 
 
 def fit_predict_tf(
@@ -86,6 +108,7 @@ def fit_predict_tf(
     p: int,
     kind: Kind,
     cfg: RollConfig,
+    exog_arr: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Train on y[0:t] (exclusive of y[t]); predict y[t]..y[t+H-1] for horizons 1..H.
@@ -95,28 +118,34 @@ def fit_predict_tf(
     if train_end < p + 1:
         raise ValueError("insufficient history")
     y_tr = y_arr[:train_end]
-    X, Y = y_to_matrix(y_tr, p)
+    exog_tr = exog_arr[:train_end] if exog_arr is not None else None
+    X, Y = _build_xy_with_exog(y_tr, exog_tr, p)
     if len(Y) < 5:
         raise ValueError("too few training rows")
 
     set_seeds(cfg.seed)
     if kind == "lstm":
-        X_chrono = X
-        Xs, Ys, sx, sy = _scale_xy_lstm(X_chrono, Y)
-        model = build_lstm(p, cfg.hidden, cfg.lr)
+        Xs, Ys, sx, sy = _scale_xy_lstm(X, Y)
+        model = build_lstm(p, cfg.hidden, cfg.lr, n_features=X.shape[2])
         fit_model(model, Xs, Ys, epochs=cfg.epochs, verbose=cfg.verbose_fit)
     elif kind == "nn":
         Xs, Ys, sx, sy = _scale_xy_ff(X, Y)
-        model = build_nn(p, cfg.hidden, cfg.lr)
+        model = build_nn(Xs.shape[1], cfg.hidden, cfg.lr)
         fit_model(model, Xs, Ys, epochs=cfg.epochs, verbose=cfg.verbose_fit)
     else:
         Xs, Ys, sx, sy = _scale_xy_ff(X, Y)
-        model = build_ar_linear(p, cfg.lr)
+        model = build_ar_linear(Xs.shape[1], cfg.lr)
         fit_model(model, Xs, Ys, epochs=cfg.epochs, verbose=cfg.verbose_fit)
 
-    lags = y_arr[t - p : t]
+    lags_y = y_arr[t - p : t].reshape(-1, 1)
+    if exog_arr is not None:
+        lags_ex = exog_arr[t - p : t, :]
+        lags = np.concatenate([lags_y, lags_ex], axis=1)
+    else:
+        lags = lags_y
     horizon = min(12, len(y_arr) - t)
-    fc = _predict_multistep_tf(model, kind, lags, p, horizon, sx, sy)
+    exog_future = exog_arr[t : t + horizon, :] if exog_arr is not None else None
+    fc = _predict_multistep_tf(model, kind, lags, p, horizon, sx, sy, exog_future=exog_future)
     actual = y_arr[t : t + horizon]
     return fc, actual
 
@@ -353,6 +382,7 @@ def forecast_ms_ar(
 
 def msfe_matrix(
     y: pd.Series,
+    exog: pd.DataFrame | None,
     test_start: pd.Timestamp,
     cfg: RollConfig,
     models: list[str],
@@ -375,6 +405,7 @@ def msfe_matrix(
     next rolling origin.
     """
     y_arr = y.values.astype(float)
+    exog_arr = exog.values.astype(float) if exog is not None else None
     dates = y.index
     ts = pd.Timestamp(test_start)
     if ts in dates:
@@ -443,11 +474,11 @@ def msfe_matrix(
                 elif m == "MS":
                     fc, act = forecast_ms_ar(y_arr, t, order=min(2, p_bic), seed=cfg.seed + t)
                 elif m == "AR":
-                    fc, act = fit_predict_tf(y_arr, t, p_bic, "ar", cfg)
+                    fc, act = fit_predict_tf(y_arr, t, p_bic, "ar", cfg, exog_arr=exog_arr)
                 elif m == "NN":
-                    fc, act = fit_predict_tf(y_arr, t, p_bic, "nn", cfg)
+                    fc, act = fit_predict_tf(y_arr, t, p_bic, "nn", cfg, exog_arr=exog_arr)
                 elif m == "LSTM":
-                    fc, act = fit_predict_tf(y_arr, t, p_lstm, "lstm", cfg)
+                    fc, act = fit_predict_tf(y_arr, t, p_lstm, "lstm", cfg, exog_arr=exog_arr)
                 else:
                     continue
             except Exception:

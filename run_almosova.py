@@ -20,7 +20,7 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import pandas as pd
 
-from data_fred import load_inflation
+from data_fred import load_inflation, load_macro_features, load_month_features
 from rolling_forecast import RollConfig, msfe_matrix
 
 
@@ -35,6 +35,16 @@ def main() -> None:
     ap.add_argument("--max-lag", type=int, default=24, help="Max lags; LSTM uses this fixed if --no-bic")
     ap.add_argument("--bic", action="store_true", help="Use BIC lag for AR/NN (LSTM still uses --max-lag)")
     ap.add_argument("--quick", action="store_true", help="3 origins, 80 epochs, subset of models")
+    ap.add_argument(
+        "--use-macro",
+        action="store_true",
+        help="Use multivariate lag features (Interest Rate/Oil/INDPRO) for AR/NN/LSTM",
+    )
+    ap.add_argument(
+        "--use-month-features",
+        action="store_true",
+        help="Add cyclical month-of-year features (month_sin/month_cos) for AR/NN/LSTM",
+    )
     ap.add_argument(
         "--models",
         nargs="*",
@@ -82,6 +92,14 @@ def main() -> None:
         args.models = ["RW", "AR", "LSTM"]
 
     y = load_inflation(kind=args.data)
+    exog_parts = []
+    if args.use_macro:
+        macro = load_macro_features(start=str(y.index.min().date()), end=str(y.index.max().date()))
+        exog_parts.append(macro.reindex(y.index).ffill().bfill())
+    if args.use_month_features:
+        exog_parts.append(load_month_features(y.index))
+    exog = pd.concat(exog_parts, axis=1) if exog_parts else None
+
     cfg = RollConfig(
         max_lag=args.max_lag,
         use_bic=args.bic,
@@ -93,6 +111,7 @@ def main() -> None:
     test_start = pd.Timestamp(args.test_start)
     df = msfe_matrix(
         y,
+        exog=exog,
         test_start=test_start,
         cfg=cfg,
         models=args.models,
